@@ -602,7 +602,7 @@ fn generate_filesystem(out_path: &Path, config: &Config) -> Result<(), ConfigErr
             info!("Generating bindings to WDK: filesystem.rs");
 
             let header_contents =
-                config.bindgen_header_contents([ApiSubset::Filesystem]);
+                config.bindgen_header_contents([ApiSubset::Filesystem])?;
             trace!(header_contents = ?header_contents);
 
             let bindgen_builder = {
@@ -612,7 +612,7 @@ fn generate_filesystem(out_path: &Path, config: &Config) -> Result<(), ConfigErr
 
                 // Only allowlist files in the usb-specific files to avoid
                 // duplicate definitions
-                for header_file in config.headers(ApiSubset::Filesystem) {
+                for header_file in config.headers(ApiSubset::Filesystem)? {
                     builder = builder.allowlist_file(format!("(?i).*{header_file}.*"));
                 }
                 builder
