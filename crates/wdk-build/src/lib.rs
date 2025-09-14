@@ -751,14 +751,14 @@ impl Config {
             ApiSubset::Spb => self.spb_headers(),
             ApiSubset::Storage => self.storage_headers(),
             ApiSubset::Usb => return self.usb_headers().map(std::iter::IntoIterator::into_iter),
-            ApiSubset::Filesystem => Self::filesystem_headers(),                    
+            ApiSubset::Filesystem => Self::filesystem_headers(),
         };
         Ok(headers
             .into_iter()
             .map(String::from)
             .collect::<Vec<_>>()
             .into_iter())
-   }
+    }
 
     fn base_headers(&self) -> Vec<&'static str> {
         match &self.driver_config {
@@ -977,28 +977,33 @@ impl Config {
         &self,
         api_subsets: impl IntoIterator<Item = ApiSubset>,
     ) -> Result<String, ConfigError> {
-        Ok(api_subsets
-            .into_iter()
-<<<<<<< HEAD
-            .map(|api_subset| self.headers(api_subset))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flat_map(|iter| iter.map(|header| format!("#include \"{header}\"\n")))
-            .collect())
-=======
-            .flat_map(|api_subset| {
-                self.headers(api_subset)
-                    .map(move |header| format!("#include \"{header}\"\n")).chain(
-                        std::iter::once(String::from(if api_subset == ApiSubset::Filesystem {
+        let mut r = String::new();
+
+        for api_subset in api_subsets {
+            match self.headers(api_subset) {
+                Ok(headers) => {
+                    r.push_str(
+                        &headers
+                            .map(|header| format!("#include \"{header}\"\n"))
+                            .collect::<String>(),
+                    );
+
+                    if api_subset == ApiSubset::Filesystem {
+                        r.push_str(
                             r#"#include <initguid.h>
 #undef INITGUID
 #include <guiddef.h>
-"#
-                        } else {""})
-                    ))
-            })
-            .collect::<String>()        
->>>>>>> pr-359
+"#,
+                        );
+                    }
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(r)
     }
 
     /// Configure a Cargo build of a library that depends on the WDK. This
@@ -1951,7 +1956,6 @@ mod tests {
 #include <guiddef.h>
 "#,
             );
-
         }
     }
     mod compute_wdffunctions_symbol_name {
