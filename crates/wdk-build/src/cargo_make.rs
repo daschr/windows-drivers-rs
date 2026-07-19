@@ -15,20 +15,21 @@ use core::{fmt, ops::RangeFrom};
 use std::{
     env,
     panic::UnwindSafe,
-    path::{absolute, Path, PathBuf},
+    path::{Path, PathBuf, absolute},
     process::Command,
 };
 
 use anyhow::Context;
-use cargo_metadata::{camino::Utf8Path, Metadata, MetadataCommand};
-use clap::{Args, Parser};
-use tracing::{instrument, trace};
+use cargo_metadata::{Metadata, MetadataCommand, camino::Utf8Path};
+use clap::{Args, ColorChoice, CommandFactory, FromArgMatches, Parser};
+use tracing::{instrument, trace, warn};
 
 use crate::{
-    metadata,
-    utils::{detect_wdk_content_root, detect_windows_sdk_version, get_wdk_version_number},
     ConfigError,
     CpuArchitecture,
+    IoError,
+    metadata,
+    utils::{detect_wdk_content_root, detect_windows_sdk_version, get_wdk_version_number, set_var},
 };
 
 /// The filename of the main makefile for Rust Windows drivers.
@@ -49,6 +50,7 @@ const WDK_BUILD_OUTPUT_DIRECTORY_ENV_VAR: &str = "WDK_BUILD_OUTPUT_DIRECTORY";
 /// build` and `cargo test` commands
 const CARGO_MAKE_CARGO_BUILD_TEST_FLAGS_ENV_VAR: &str = "CARGO_MAKE_CARGO_BUILD_TEST_FLAGS";
 
+const CARGO_MAKE_DISABLE_COLOR_ENV_VAR: &str = "CARGO_MAKE_DISABLE_COLOR";
 const CARGO_MAKE_PROFILE_ENV_VAR: &str = "CARGO_MAKE_PROFILE";
 const CARGO_MAKE_CARGO_PROFILE_ENV_VAR: &str = "CARGO_MAKE_CARGO_PROFILE";
 const CARGO_MAKE_CRATE_TARGET_TRIPLE_ENV_VAR: &str = "CARGO_MAKE_CRATE_TARGET_TRIPLE";
@@ -73,6 +75,7 @@ trait ParseCargoArgs {
 }
 
 #[derive(Parser, Debug)]
+#[command(styles = clap_cargo::style::CLAP_STYLING)]
 struct CommandLineInterface {
     #[command(flatten)]
     base: BaseOptions,
@@ -334,14 +337,14 @@ impl ParseCargoArgs for CompilationOptions {
         {
             "release" => {
                 // cargo-make release profile sets the `--profile release` flag
-                if let Some(profile) = &profile {
-                    if profile != "release" {
-                        eprintln!(
-                            "Specifying `--profile release` for cargo-make conflicts with the \
-                             setting `--profile {profile}` to forward to tasks"
-                        );
-                        std::process::exit(CLAP_USAGE_EXIT_CODE);
-                    }
+                if let Some(profile) = &profile
+                    && profile != "release"
+                {
+                    eprintln!(
+                        "Specifying `--profile release` for cargo-make conflicts with the setting \
+                         `--profile {profile}` to forward to tasks"
+                    );
+                    std::process::exit(CLAP_USAGE_EXIT_CODE);
                 }
 
                 append_to_space_delimited_env_var(
@@ -375,7 +378,7 @@ impl ParseCargoArgs for CompilationOptions {
             }
         };
 
-        env::set_var(CARGO_MAKE_CARGO_PROFILE_ENV_VAR, &cargo_make_cargo_profile);
+        set_var(CARGO_MAKE_CARGO_PROFILE_ENV_VAR, &cargo_make_cargo_profile);
 
         if let Some(jobs) = &jobs {
             append_to_space_delimited_env_var(
@@ -385,7 +388,7 @@ impl ParseCargoArgs for CompilationOptions {
         }
 
         if let Some(target) = &target {
-            env::set_var(CARGO_MAKE_CRATE_TARGET_TRIPLE_ENV_VAR, target);
+            set_var(CARGO_MAKE_CRATE_TARGET_TRIPLE_ENV_VAR, target);
             append_to_space_delimited_env_var(
                 CARGO_MAKE_CARGO_BUILD_TEST_FLAGS_ENV_VAR,
                 format!("--target {target}").as_str(),
@@ -479,10 +482,23 @@ pub fn validate_command_line_args() -> impl IntoIterator<Item = String> {
     };
 
     if let Some(toolchain) = toolchain_arg {
-        env::set_var(CARGO_MAKE_RUST_DEFAULT_TOOLCHAIN_ENV_VAR, toolchain);
+        set_var(CARGO_MAKE_RUST_DEFAULT_TOOLCHAIN_ENV_VAR, toolchain);
     }
 
-    CommandLineInterface::parse_from(env_args.iter()).parse_cargo_args();
+    CommandLineInterface::from_arg_matches_mut(
+        &mut CommandLineInterface::command()
+            .color(if is_cargo_make_color_disabled() {
+                ColorChoice::Never
+            } else {
+                // `ColorChoice::Always` is used instead of `ColorChoice::Auto` to force color.
+                // This function is always executed from rust-script invoked by cargo-make,
+                // whose piping of stdout/stderr disables color by default.
+                ColorChoice::Always
+            })
+            .get_matches_from(env_args),
+    )
+    .unwrap_or_else(|err| err.exit())
+    .parse_cargo_args();
 
     [
         CARGO_MAKE_CARGO_BUILD_TEST_FLAGS_ENV_VAR,
@@ -494,6 +510,17 @@ pub fn validate_command_line_args() -> impl IntoIterator<Item = String> {
     .into_iter()
     .filter(|env_var_name| env::var_os(env_var_name).is_some())
     .map(ToString::to_string)
+}
+
+fn is_cargo_make_color_disabled() -> bool {
+    env::var(CARGO_MAKE_DISABLE_COLOR_ENV_VAR).is_ok_and(|value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            // when color is enabled in cargo-make, the env var is guaranteed to be set to one
+            // of the below values, or not be set at all
+            "0" | "false" | "no" | ""
+        )
+    })
 }
 
 /// Prepends the path variable with the necessary paths to access WDK(+SDK)
@@ -520,22 +547,29 @@ pub fn setup_path() -> Result<impl IntoIterator<Item = String>, ConfigError> {
 
     let wdk_bin_root = get_wdk_bin_root(&wdk_content_root, &sdk_version);
 
-    let host_windows_sdk_ver_bin_path = absolute(wdk_bin_root.join(host_arch.as_windows_str()))?
-        .to_str()
-        .expect("WDK bin path should be valid UTF-8")
-        .to_string();
+    let host_windows_sdk_ver_bin_path = {
+        let path = wdk_bin_root.join(host_arch.as_windows_str());
+        absolute(&path).map_err(|source| IoError::with_path(path, source))?
+    }
+    .to_str()
+    .expect("WDK bin path should be valid UTF-8")
+    .to_string();
 
-    let x86_windows_sdk_ver_bin_path = absolute(wdk_bin_root.join("x86"))?
-        .to_str()
-        .expect("WDK x86 bin path should be valid UTF-8")
-        .to_string();
+    let x86_windows_sdk_ver_bin_path = {
+        let path = wdk_bin_root.join("x86");
+        absolute(&path).map_err(|source| IoError::with_path(path, source))?
+    }
+    .to_str()
+    .expect("WDK x86 bin path should be valid UTF-8")
+    .to_string();
 
     if let Ok(sdk_bin_path) = env::var("WindowsSdkBinPath") {
-        let sdk_bin_path = absolute(
-            PathBuf::from(sdk_bin_path)
+        let sdk_bin_path = {
+            let path = PathBuf::from(sdk_bin_path)
                 .join(&sdk_version)
-                .join(host_arch.as_windows_str()),
-        )?
+                .join(host_arch.as_windows_str());
+            absolute(&path).map_err(|source| IoError::with_path(path, source))?
+        }
         .to_str()
         .expect("WindowsSdkBinPath should be valid UTF-8")
         .to_string();
@@ -544,30 +578,59 @@ pub fn setup_path() -> Result<impl IntoIterator<Item = String>, ConfigError> {
 
     prepend_to_semicolon_delimited_env_var(
         PATH_ENV_VAR,
-        format!("{host_windows_sdk_ver_bin_path};{x86_windows_sdk_ver_bin_path}",),
+        format!("{host_windows_sdk_ver_bin_path};{x86_windows_sdk_ver_bin_path}"),
     );
 
-    let wdk_tool_root = get_wdk_tools_root(&wdk_content_root, sdk_version);
-    let host_windows_sdk_version_tool_path =
-        absolute(wdk_tool_root.join(host_arch.as_windows_str()))?
-            .to_str()
-            .expect("WDK tool path should be valid UTF-8")
-            .to_string();
+    let wdk_tool_root = get_wdk_tools_root(&wdk_content_root, &sdk_version);
+    let host_windows_sdk_version_tool_path = {
+        let path = wdk_tool_root.join(host_arch.as_windows_str());
+        absolute(&path).map_err(|source| IoError::with_path(path, source))?
+    }
+    .to_str()
+    .expect("WDK tool path should be valid UTF-8")
+    .to_string();
     prepend_to_semicolon_delimited_env_var(PATH_ENV_VAR, host_windows_sdk_version_tool_path);
 
     Ok([PATH_ENV_VAR].map(ToString::to_string))
 }
 
-fn get_wdk_tools_root(wdk_content_root: &Path, sdk_version: String) -> PathBuf {
-    env::var("WDKToolRoot")
-        .map_or_else(|_| wdk_content_root.join("tools"), PathBuf::from)
-        .join(sdk_version)
+fn get_wdk_tools_root(wdk_content_root: &Path, sdk_version: &str) -> PathBuf {
+    get_path_from_env("WDKToolRoot", wdk_content_root, "tools", sdk_version)
 }
 
-fn get_wdk_bin_root(wdk_content_root: &Path, sdk_version: &String) -> PathBuf {
-    env::var("WDKBinRoot")
-        .map_or_else(|_| wdk_content_root.join("bin"), PathBuf::from)
-        .join(sdk_version)
+fn get_wdk_bin_root(wdk_content_root: &Path, sdk_version: &str) -> PathBuf {
+    get_path_from_env("WDKBinRoot", wdk_content_root, "bin", sdk_version)
+}
+
+/// Reads path from the given env variable or falls back to
+/// constructing it from WDK content root.
+///
+/// The path in `env_var` is already the full path because eWDK
+/// and Nuget CLI set it that way. In the fallback however we
+/// have to append `sub_folder` and `sdk_version` manually.
+fn get_path_from_env(
+    env_var: &str,
+    wdk_content_root: &Path,
+    sub_folder: &str,
+    sdk_version: &str,
+) -> PathBuf {
+    env::var(env_var).map_or_else(
+        |e| {
+            const FALLBACK_MSG: &str = "Constructing path from WDK content root instead";
+            match e {
+                env::VarError::NotPresent => {
+                    trace!("Env var '{env_var}' not found. {FALLBACK_MSG}");
+                }
+                env::VarError::NotUnicode(val) => {
+                    warn!(
+                        "Env var '{env_var}' contains non-UTF8 characters: {val:?}. {FALLBACK_MSG}"
+                    );
+                }
+            }
+            wdk_content_root.join(sub_folder).join(sdk_version)
+        },
+        PathBuf::from,
+    )
 }
 
 /// Forwards the specified environment variables in this process to the parent
@@ -633,7 +696,7 @@ pub fn setup_wdk_version() -> Result<impl IntoIterator<Item = String>, ConfigErr
         });
     }
 
-    env::set_var(WDK_VERSION_ENV_VAR, detected_sdk_version);
+    set_var(WDK_VERSION_ENV_VAR, detected_sdk_version);
     Ok([WDK_VERSION_ENV_VAR].map(ToString::to_string))
 }
 
@@ -661,8 +724,9 @@ pub fn setup_infverif_for_samples<S: AsRef<str> + ToString + ?Sized>(
         .parse::<i32>()
         .expect("Unable to parse the build number of the WDK version string as an int!");
     let sample_flag = if version > MINIMUM_SAMPLES_FLAG_WDK_VERSION {
-        "/samples" // Note: Not currently implemented, so in samples TOML we
-                   // currently skip infverif
+        // Note: Not currently implemented, so in samples TOML we currently skip
+        // infverif
+        "/samples"
     } else {
         "/msft"
     };
@@ -695,10 +759,7 @@ pub fn get_wdk_build_output_directory() -> PathBuf {
 #[must_use]
 pub fn get_current_package_name() -> String {
     env::var(CARGO_MAKE_CRATE_FS_NAME_ENV_VAR).unwrap_or_else(|_| {
-        panic!(
-            "{} should be set by cargo-make",
-            &CARGO_MAKE_CRATE_FS_NAME_ENV_VAR
-        )
+        panic!("{CARGO_MAKE_CRATE_FS_NAME_ENV_VAR} should be set by cargo-make")
     })
 }
 
@@ -719,7 +780,8 @@ pub fn copy_to_driver_package_folder<P: AsRef<Path>>(path_to_copy: P) -> Result<
     let package_folder_path: PathBuf =
         get_wdk_build_output_directory().join(format!("{}_package", get_current_package_name()));
     if !package_folder_path.exists() {
-        std::fs::create_dir(&package_folder_path)?;
+        std::fs::create_dir(&package_folder_path)
+            .map_err(|source| IoError::with_path(&package_folder_path, source))?;
     }
 
     let destination_path = package_folder_path.join(
@@ -727,7 +789,8 @@ pub fn copy_to_driver_package_folder<P: AsRef<Path>>(path_to_copy: P) -> Result<
             .file_name()
             .expect("path_to_copy should always end with a valid file or directory name"),
     );
-    std::fs::copy(path_to_copy, destination_path)?;
+    std::fs::copy(path_to_copy, &destination_path)
+        .map_err(|source| IoError::with_src_dest_paths(path_to_copy, destination_path, source))?;
 
     Ok(())
 }
@@ -786,7 +849,7 @@ pub fn load_rust_driver_sample_makefile() -> Result<(), ConfigError> {
 /// This is necessary so that paths in the [`wdk_build`] makefile can be
 /// relative to `CARGO_MAKE_CURRENT_TASK_INITIAL_MAKEFILE_DIRECTORY`. The
 /// version of `wdk-build` from which the file being symlinked to comes from is
-/// determined by the workding directory of the process that invokes this
+/// determined by the working directory of the process that invokes this
 /// function. For example, if this function is ultimately executing in a
 /// `cargo_make` `load_script`, the files will be symlinked from the `wdk-build`
 /// version that is in the `.Cargo.lock` file, and not the `wdk-build` version
@@ -838,7 +901,8 @@ fn load_wdk_build_makefile<S: AsRef<str> + AsRef<Utf8Path> + AsRef<Path> + fmt::
         .manifest_path
         .parent()
         .expect("The parsed manifest_path should have a valid parent directory")
-        .join(&makefile_name);
+        .join(&makefile_name)
+        .into_std_path_buf();
 
     let cargo_make_workspace_working_directory =
         env::var(CARGO_MAKE_WORKSPACE_WORKING_DIRECTORY_ENV_VAR).unwrap_or_else(|_| {
@@ -852,18 +916,29 @@ fn load_wdk_build_makefile<S: AsRef<str> + AsRef<Utf8Path> + AsRef<Path> + fmt::
     // Only create a new symlink if the existing one is not already pointing to the
     // correct file
     if !destination_path.exists() {
-        return Ok(std::os::windows::fs::symlink_file(
-            rust_driver_makefile_toml_path,
-            destination_path,
-        )?);
+        std::os::windows::fs::symlink_file(&rust_driver_makefile_toml_path, &destination_path)
+            .map_err(|source| {
+                IoError::with_src_dest_paths(
+                    rust_driver_makefile_toml_path,
+                    destination_path,
+                    source,
+                )
+            })?;
     } else if !destination_path.is_symlink()
-        || std::fs::read_link(&destination_path)? != rust_driver_makefile_toml_path
+        || std::fs::read_link(&destination_path)
+            .map_err(|source| IoError::with_path(&destination_path, source))?
+            != rust_driver_makefile_toml_path
     {
-        std::fs::remove_file(&destination_path)?;
-        return Ok(std::os::windows::fs::symlink_file(
-            rust_driver_makefile_toml_path,
-            destination_path,
-        )?);
+        std::fs::remove_file(&destination_path)
+            .map_err(|source| IoError::with_path(&destination_path, source))?;
+        std::os::windows::fs::symlink_file(&rust_driver_makefile_toml_path, &destination_path)
+            .map_err(|source| {
+                IoError::with_src_dest_paths(
+                    rust_driver_makefile_toml_path,
+                    destination_path,
+                    source,
+                )
+            })?;
     }
 
     // Symlink is already up to date
@@ -954,10 +1029,7 @@ pub fn package_driver_flow_condition_script() -> anyhow::Result<()> {
         // `CARGO_MAKE_CRATE_FS_NAME_ENV_VAR`, since `cargo_metadata` output uses the
         // non-preprocessed name (ie. - instead of _)
         let current_package_name = env::var(CARGO_MAKE_CRATE_NAME_ENV_VAR).unwrap_or_else(|_| {
-            panic!(
-                "{} should be set by cargo-make",
-                &CARGO_MAKE_CRATE_NAME_ENV_VAR
-            )
+            panic!("{CARGO_MAKE_CRATE_NAME_ENV_VAR} should be set by cargo-make")
         });
         let cargo_metadata = get_cargo_metadata()?;
 
@@ -1103,7 +1175,7 @@ fn configure_wdf_build_output_dir(target_arg: Option<&String>, cargo_make_cargo_
 
         output_dir
     };
-    env::set_var(
+    set_var(
         WDK_BUILD_OUTPUT_DIRECTORY_ENV_VAR,
         wdk_build_output_directory,
     );
@@ -1120,7 +1192,7 @@ where
     let mut env_var_value: String = env::var(env_var_name).unwrap_or_default();
     env_var_value.push(' ');
     env_var_value.push_str(string_to_append);
-    env::set_var(env_var_name, env_var_value.trim());
+    set_var(env_var_name, env_var_value.trim());
 }
 
 fn prepend_to_semicolon_delimited_env_var<S, T>(env_var_name: S, string_to_prepend: T)
@@ -1134,7 +1206,7 @@ where
     let mut env_var_value = string_to_prepend.to_string();
     env_var_value.push(';');
     env_var_value.push_str(env::var(env_var_name).unwrap_or_default().as_str());
-    env::set_var(env_var_name, env_var_value);
+    set_var(env_var_name, env_var_value);
 }
 
 /// `cargo-make` condition script for `infverif` task in
@@ -1173,28 +1245,162 @@ pub fn driver_sample_infverif_condition_script() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::ConfigError;
+    mod setup_infverif_for_samples {
+        use crate::ConfigError;
 
-    const WDK_TEST_OLD_INF_VERSION: &str = "10.0.22061.0";
-    const WDK_TEST_NEW_INF_VERSION: &str = "10.0.26100.0";
+        const WDK_TEST_OLD_INF_VERSION: &str = "10.0.22061.0";
+        const WDK_TEST_NEW_INF_VERSION: &str = "10.0.26100.0";
 
-    #[test]
-    fn check_env_passing() -> Result<(), ConfigError> {
-        crate::cargo_make::setup_infverif_for_samples(WDK_TEST_OLD_INF_VERSION)?;
-        let env_string = std::env::var_os(crate::cargo_make::WDK_INF_ADDITIONAL_FLAGS_ENV_VAR)
-            .map_or_else(
-                || panic!("Couldn't get OS string"),
-                |os_env_string| os_env_string.to_string_lossy().into_owned(),
+        #[test]
+        fn sample_drivers_flag_selection() -> Result<(), ConfigError> {
+            // Old version should map to /msft
+            crate::cargo_make::setup_infverif_for_samples(WDK_TEST_OLD_INF_VERSION)?;
+            let env_string = std::env::var_os(crate::cargo_make::WDK_INF_ADDITIONAL_FLAGS_ENV_VAR)
+                .map_or_else(
+                    || panic!("Couldn't get OS string"),
+                    |os_env_string| os_env_string.to_string_lossy().into_owned(),
+                );
+            assert_eq!(env_string.split(' ').next_back(), Some("/msft"));
+
+            // Newer version should map to /samples
+            crate::cargo_make::setup_infverif_for_samples(WDK_TEST_NEW_INF_VERSION)?;
+            let env_string = std::env::var_os(crate::cargo_make::WDK_INF_ADDITIONAL_FLAGS_ENV_VAR)
+                .map_or_else(
+                    || panic!("Couldn't get OS string"),
+                    |os_env_string| os_env_string.to_string_lossy().into_owned(),
+                );
+            assert_eq!(env_string.split(' ').next_back(), Some("/samples"));
+            Ok(())
+        }
+    }
+
+    mod setup_path {
+        use std::env;
+
+        use assert_fs::TempDir;
+
+        use super::super::{PathBuf, absolute};
+        use crate::CpuArchitecture;
+
+        /// Create a minimal fake WDK directory layout needed for path
+        /// canonicalization.
+        fn setup_test_wdk_layout(temp: &TempDir, sdk_version: &str, host_arch: &str) -> PathBuf {
+            let wdk_content_root = temp.path().to_path_buf();
+            let lib_version_path = wdk_content_root.join("Lib").join(sdk_version);
+            std::fs::create_dir_all(&lib_version_path).unwrap();
+
+            let bin_root_versioned = wdk_content_root.join("bin").join(sdk_version);
+            std::fs::create_dir_all(bin_root_versioned.join(host_arch)).unwrap();
+            std::fs::create_dir_all(bin_root_versioned.join("x86")).unwrap();
+
+            let tools_root_versioned = wdk_content_root.join("tools").join(sdk_version);
+            std::fs::create_dir_all(tools_root_versioned.join(host_arch)).unwrap();
+
+            wdk_content_root
+        }
+
+        /// Convert a list of `PathBufs` to their absolute string
+        /// representations
+        fn expected_path_strings<I>(paths: I) -> Vec<String>
+        where
+            I: IntoIterator<Item = PathBuf>,
+        {
+            paths
+                .into_iter()
+                .map(|path| absolute(path).unwrap().to_string_lossy().into_owned())
+                .collect()
+        }
+
+        /// Run a single test case for `setup_path`, setting the given env vars
+        /// and verifying that the expected PATH components are present in
+        /// order.
+        fn run_setup_path_testcase(
+            env_vars: &[(&str, Option<PathBuf>)],
+            expected_paths: &[String],
+        ) {
+            crate::tests::with_env(env_vars, || {
+                let result = super::super::setup_path()
+                    .expect("setup_path should succeed for the test layout");
+                let returned: Vec<String> = result.into_iter().collect();
+                assert_eq!(
+                    returned,
+                    vec!["Path"],
+                    "setup_path should return that only PATH was modified"
+                );
+
+                let path_value = std::env::var("Path").expect("Path should be set");
+                let mut parts = path_value.split(';');
+                for expected in expected_paths {
+                    assert_eq!(parts.next(), Some(expected.as_str()));
+                }
+            });
+        }
+
+        #[test]
+        fn without_wdk_root_env_vars() {
+            // Create test WDK directory layout
+            let temp = TempDir::new().unwrap();
+            let sdk_version = "10.0.1.0";
+            let host_cpu_arch = CpuArchitecture::try_from_cargo_str(env::consts::ARCH).unwrap();
+            let host_arch = host_cpu_arch.as_windows_str();
+            let wdk_content_root = setup_test_wdk_layout(&temp, sdk_version, host_arch);
+
+            // Calculate expected PATH components based on default WDK structure.
+            // When WDKBinRoot/WDKToolRoot are not set, setup_path constructs paths from
+            // WDKContentRoot.
+            let expected_paths = expected_path_strings(vec![
+                wdk_content_root
+                    .join("tools")
+                    .join(sdk_version)
+                    .join(host_arch),
+                wdk_content_root
+                    .join("bin")
+                    .join(sdk_version)
+                    .join(host_arch),
+                wdk_content_root.join("bin").join(sdk_version).join("x86"),
+            ]);
+
+            run_setup_path_testcase(
+                &[
+                    ("WDKContentRoot", Some(wdk_content_root)),
+                    ("WDKBinRoot", None),
+                    ("WDKToolRoot", None),
+                    ("Version_Number", None),
+                    ("WindowsSdkBinPath", None),
+                ],
+                &expected_paths,
             );
-        assert_eq!(env_string.split(' ').next_back(), Some("/msft"));
+        }
 
-        crate::cargo_make::setup_infverif_for_samples(WDK_TEST_NEW_INF_VERSION)?;
-        let env_string = std::env::var_os(crate::cargo_make::WDK_INF_ADDITIONAL_FLAGS_ENV_VAR)
-            .map_or_else(
-                || panic!("Couldn't get OS string"),
-                |os_env_string| os_env_string.to_string_lossy().into_owned(),
+        #[test]
+        fn with_wdk_root_env_vars() {
+            // Create test WDK directory layout
+            let temp = TempDir::new().unwrap();
+            let sdk_version = "10.0.1.0";
+            let host_cpu_arch = CpuArchitecture::try_from_cargo_str(env::consts::ARCH).unwrap();
+            let host_arch = host_cpu_arch.as_windows_str();
+            let wdk_content_root = setup_test_wdk_layout(&temp, sdk_version, host_arch);
+
+            // When WDKBinRoot/WDKToolRoot are set (eWDK/NuGet scenario), they should point
+            // to their respective versioned folders
+            let bin_root_versioned = wdk_content_root.join("bin").join(sdk_version);
+            let tools_root_versioned = wdk_content_root.join("tools").join(sdk_version);
+            let expected_paths = expected_path_strings(vec![
+                tools_root_versioned.join(host_arch),
+                bin_root_versioned.join(host_arch),
+                bin_root_versioned.join("x86"),
+            ]);
+
+            run_setup_path_testcase(
+                &[
+                    ("WDKContentRoot", Some(wdk_content_root)),
+                    ("WDKBinRoot", Some(bin_root_versioned)),
+                    ("WDKToolRoot", Some(tools_root_versioned)),
+                    ("Version_Number", None),
+                    ("WindowsSdkBinPath", None),
+                ],
+                &expected_paths,
             );
-        assert_eq!(env_string.split(' ').next_back(), Some("/samples"));
-        Ok(())
+        }
     }
 }

@@ -8,24 +8,47 @@
 //! validating, verifying and generating artefacts for the driver package.
 
 use std::{
+    ffi::{CStr, CString},
+    marker::PhantomData,
     ops::RangeFrom,
     path::{Path, PathBuf},
     result::Result,
 };
 
 use mockall_double::double;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use wdk_build::{CpuArchitecture, DriverConfig};
+use windows::{
+    Win32::{
+        Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0},
+        System::Threading::{CreateMutexA, INFINITE, ReleaseMutex, WaitForSingleObject},
+    },
+    core::{Error as WinError, PCSTR},
+};
 
 #[double]
 use crate::providers::{exec::CommandExec, fs::Fs, wdk_build::WdkBuild};
 use crate::{actions::build::error::PackageTaskError, providers::error::FileError};
+
+/// Signing mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignMode {
+    /// Skip signing entirely.
+    Off,
+    /// Sign with an auto-generated self-signed certificate.
+    Test {
+        /// When `true`, run `signtool verify` on the signed driver binary and
+        /// catalog file after signing.
+        verify_signature: bool,
+    },
+}
 
 // FIXME: This range is inclusive of 25798. Update with range end after /sample
 // flag is added to InfVerif CLI
 const MISSING_SAMPLE_FLAG_WDK_BUILD_NUMBER_RANGE: RangeFrom<u32> = 25798..;
 const WDR_TEST_CERT_STORE: &str = "WDRTestCertStore";
 const WDR_LOCAL_TEST_CERT: &str = "WDRLocalTestCert";
+const STAMPINF_VERSION_ENV_VAR: &str = "STAMPINF_VERSION";
 
 #[derive(Debug)]
 pub struct PackageTaskParams<'a> {
@@ -33,7 +56,7 @@ pub struct PackageTaskParams<'a> {
     pub working_dir: &'a Path,
     pub target_dir: &'a Path,
     pub target_arch: &'a CpuArchitecture,
-    pub verify_signature: bool,
+    pub sign_mode: SignMode,
     pub sample_class: bool,
     pub driver_model: DriverConfig,
 }
@@ -41,7 +64,7 @@ pub struct PackageTaskParams<'a> {
 /// Supports low level driver packaging operations
 pub struct PackageTask<'a> {
     package_name: String,
-    verify_signature: bool,
+    sign_mode: SignMode,
     sample_class: bool,
 
     // src paths
@@ -151,7 +174,7 @@ impl<'a> PackageTask<'a> {
 
         Self {
             package_name,
-            verify_signature: params.verify_signature,
+            sign_mode: params.sign_mode,
             sample_class: params.sample_class,
             src_inx_file_path,
             src_driver_binary_file_path,
@@ -226,6 +249,20 @@ impl<'a> PackageTask<'a> {
         self.copy(&self.src_map_file_path, &self.dest_map_file_path)?;
         self.run_stampinf()?;
         self.run_inf2cat()?;
+        self.run_infverif()?;
+        self.sign_and_verify()?;
+        Ok(())
+    }
+
+    /// Signs the driver binary and catalog file according to `self.sign_mode`
+    /// and optionally verifies the resulting signatures. Returns a variant of
+    /// `PackageTaskError` if any step of the process fails.
+    fn sign_and_verify(&self) -> Result<(), PackageTaskError> {
+        let SignMode::Test { verify_signature } = self.sign_mode else {
+            info!("Sign mode is 'off'; skipping signing");
+            return Ok(());
+        };
+
         self.generate_certificate()?;
         self.copy(&self.src_cert_file_path, &self.dest_cert_file_path)?;
         self.run_signtool_sign(
@@ -238,13 +275,13 @@ impl<'a> PackageTask<'a> {
             WDR_TEST_CERT_STORE,
             WDR_LOCAL_TEST_CERT,
         )?;
-        self.run_infverif()?;
-        // Verify signatures only when --verify-signature flag = true is passed
-        if self.verify_signature {
+
+        if verify_signature {
             info!("Verifying signatures for driver binary and cat file using signtool");
             self.run_signtool_verify(&self.dest_driver_binary_path)?;
             self.run_signtool_verify(&self.dest_cat_file_path)?;
         }
+
         Ok(())
     }
 
@@ -279,7 +316,7 @@ impl<'a> PackageTask<'a> {
     }
 
     fn run_stampinf(&self) -> Result<(), PackageTaskError> {
-        info!("Running stampinf command.");
+        info!("Running stampinf");
         let wdf_version_flags = match self.driver_model {
             DriverConfig::Kmdf(kmdf_config) => {
                 vec![
@@ -313,20 +350,34 @@ impl<'a> PackageTask<'a> {
             &arch,
             "-c",
             &cat_file_path,
-            "-v",
-            "*",
         ];
+
+        match std::env::var(STAMPINF_VERSION_ENV_VAR) {
+            Ok(version) if !version.trim().is_empty() => {
+                // When STAMPINF_VERSION is set to a non-empty, non-whitespace value, we
+                // intentionally omit -v so stampinf reads it and populates
+                // DriverVer. (Whitespace-only values are ignored.)
+                debug!(
+                    DriverVer = version,
+                    "Using {STAMPINF_VERSION_ENV_VAR} env var to set DriverVer"
+                );
+            }
+            _ => {
+                args.extend(["-v", "*"]);
+            }
+        }
+
         if !wdf_version_flags.is_empty() {
             args.append(&mut wdf_version_flags.iter().map(String::as_str).collect());
         }
-        if let Err(e) = self.command_exec.run("stampinf", &args, None) {
+        if let Err(e) = self.command_exec.run("stampinf", &args, None, None) {
             return Err(PackageTaskError::StampinfCommand(e));
         }
         Ok(())
     }
 
     fn run_inf2cat(&self) -> Result<(), PackageTaskError> {
-        info!("Running inf2cat command.");
+        info!("Running inf2cat");
         let args = [
             &format!(
                 "/driver:{}",
@@ -338,7 +389,7 @@ impl<'a> PackageTask<'a> {
             "/uselocaltime",
         ];
 
-        if let Err(e) = self.command_exec.run("inf2cat", &args, None) {
+        if let Err(e) = self.command_exec.run("inf2cat", &args, None, None) {
             return Err(PackageTaskError::Inf2CatCommand(e));
         }
 
@@ -346,23 +397,41 @@ impl<'a> PackageTask<'a> {
     }
 
     fn generate_certificate(&self) -> Result<(), PackageTaskError> {
-        debug!("Generating certificate.");
+        debug!("Generating certificate");
         if self.fs.exists(&self.src_cert_file_path) {
             return Ok(());
         }
         if self.is_self_signed_certificate_in_store()? {
             self.create_cert_file_from_store()?;
         } else {
-            self.create_self_signed_cert_in_store()?;
+            // This mutex prevents multiple instances of this app from racing to
+            // create a cert in the store. It is not a correctness problem. We
+            // just don't want to litter the store with certs especially during
+            // tests when there are lots of parallel runs
+            let mutex_name = CString::new("WDRCertStoreMutex_bd345cf9330") // Unique enough
+                .expect("string is a valid C string");
+            let mutex = NamedMutex::acquire(&mutex_name)
+                .map_err(|e| PackageTaskError::CertMutexError(e.code().0))?;
+            debug!("Acquired cert store mutex");
+
+            // Check again for an existing cert. Another instance might have
+            // created it while we waited for the mutex
+            if self.is_self_signed_certificate_in_store()? {
+                drop(mutex);
+                self.create_cert_file_from_store()?;
+            } else {
+                self.create_self_signed_cert_in_store()?;
+            }
         }
+
         Ok(())
     }
 
     fn is_self_signed_certificate_in_store(&self) -> Result<bool, PackageTaskError> {
-        debug!("Checking if self signed certificate exists in WDRTestCertStore store.");
+        debug!("Checking if self signed certificate exists in WDRTestCertStore store");
         let args = ["-s", WDR_TEST_CERT_STORE];
 
-        match self.command_exec.run("certmgr.exe", &args, None) {
+        match self.command_exec.run("certmgr.exe", &args, None, None) {
             Ok(output) if output.status.success() => String::from_utf8(output.stdout).map_or_else(
                 |e| Err(PackageTaskError::VerifyCertExistsInStoreInvalidCommandOutput(e)),
                 |stdout| Ok(stdout.contains(WDR_LOCAL_TEST_CERT)),
@@ -373,7 +442,7 @@ impl<'a> PackageTask<'a> {
     }
 
     fn create_self_signed_cert_in_store(&self) -> Result<(), PackageTaskError> {
-        info!("Creating self signed certificate in WDRTestCertStore store using makecert.");
+        info!("Creating self signed certificate in WDRTestCertStore store using makecert");
         let cert_path = self.src_cert_file_path.to_string_lossy();
         let args = [
             "-r",
@@ -388,14 +457,14 @@ impl<'a> PackageTask<'a> {
             &format!("CN={WDR_LOCAL_TEST_CERT}"), // FIXME: this should be a parameter
             &cert_path,
         ];
-        if let Err(e) = self.command_exec.run("makecert", &args, None) {
+        if let Err(e) = self.command_exec.run("makecert", &args, None, None) {
             return Err(PackageTaskError::CertGenerationInStoreCommand(e));
         }
         Ok(())
     }
 
     fn create_cert_file_from_store(&self) -> Result<(), PackageTaskError> {
-        info!("Creating certificate file from WDRTestCertStore store using certmgr.");
+        info!("Creating certificate file from WDRTestCertStore store using certmgr");
         let cert_path = self.src_cert_file_path.to_string_lossy();
         let args = [
             "-put",
@@ -406,7 +475,7 @@ impl<'a> PackageTask<'a> {
             WDR_LOCAL_TEST_CERT,
             &cert_path,
         ];
-        if let Err(e) = self.command_exec.run("certmgr.exe", &args, None) {
+        if let Err(e) = self.command_exec.run("certmgr.exe", &args, None, None) {
             return Err(PackageTaskError::CreateCertFileFromStoreCommand(e));
         }
         Ok(())
@@ -428,7 +497,7 @@ impl<'a> PackageTask<'a> {
         cert_name: &str,
     ) -> Result<(), PackageTaskError> {
         info!(
-            "Signing {} using signtool.",
+            "Signing {} using signtool",
             file_path
                 .file_name()
                 .expect("Unable to read file name from the path")
@@ -448,7 +517,7 @@ impl<'a> PackageTask<'a> {
             "SHA256",
             &driver_binary_file_path,
         ];
-        if let Err(e) = self.command_exec.run("signtool", &args, None) {
+        if let Err(e) = self.command_exec.run("signtool", &args, None, None) {
             return Err(PackageTaskError::DriverBinarySignCommand(e));
         }
         Ok(())
@@ -456,7 +525,7 @@ impl<'a> PackageTask<'a> {
 
     fn run_signtool_verify(&self, file_path: &Path) -> Result<(), PackageTaskError> {
         info!(
-            "Verifying {} using signtool.",
+            "Verifying {} using signtool",
             file_path
                 .file_name()
                 .expect("Unable to read file name from the path")
@@ -466,14 +535,13 @@ impl<'a> PackageTask<'a> {
         let args = ["verify", "/v", "/pa", &driver_binary_file_path];
         // TODO: Differentiate between command exec failure and signature verification
         // failure
-        if let Err(e) = self.command_exec.run("signtool", &args, None) {
+        if let Err(e) = self.command_exec.run("signtool", &args, None, None) {
             return Err(PackageTaskError::DriverBinarySignVerificationCommand(e));
         }
         Ok(())
     }
 
     fn run_infverif(&self) -> Result<(), PackageTaskError> {
-        info!("Running infverif command.");
         let additional_args = if self.sample_class {
             let wdk_build_number = self.wdk_build.detect_wdk_build_number()?;
             if MISSING_SAMPLE_FLAG_WDK_BUILD_NUMBER_RANGE.contains(&wdk_build_number) {
@@ -481,13 +549,15 @@ impl<'a> PackageTask<'a> {
                     "InfVerif in WDK Build {wdk_build_number} is bugged and does not contain the \
                      /samples flag."
                 );
-                info!("Skipping InfVerif for samples class. WDK Build: {wdk_build_number}");
+                warn!("InfVerif skipped for samples class. WDK Build: {wdk_build_number}");
                 return Ok(());
             }
             "/msft"
         } else {
             ""
         };
+
+        info!("Running infverif");
         let mut args = vec![
             "/v",
             match self.driver_model {
@@ -504,16 +574,75 @@ impl<'a> PackageTask<'a> {
         }
         args.push(&inf_path);
 
-        if let Err(e) = self.command_exec.run("infverif", &args, None) {
+        if let Err(e) = self.command_exec.run("infverif", &args, None, None) {
             return Err(PackageTaskError::InfVerificationCommand(e));
         }
 
         Ok(())
     }
 }
+
+/// An RAII wrapper over a Win API named mutex
+struct NamedMutex {
+    handle: HANDLE,
+    // `ReleaseMutex` requires that it is called
+    // only by threads that own the mutex handle.
+    // Being `!Send` ensures that's always the case.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl NamedMutex {
+    /// Acquires named mutex
+    pub fn acquire(name: &CStr) -> Result<Self, WinError> {
+        fn get_last_error() -> WinError {
+            // SAFETY: We have to just assume this function is safe to call
+            // because the windows crate has no documentation for it and
+            // the MSDN documentation does not specify any preconditions
+            // for calling it
+            unsafe { GetLastError().into() }
+        }
+
+        // SAFETY: The name ptr is valid because it comes from a CStr
+        let handle = unsafe { CreateMutexA(None, false, PCSTR(name.as_ptr().cast()))? };
+        if handle.is_invalid() {
+            return Err(get_last_error());
+        }
+
+        // SAFETY: The handle is valid since it was created right above
+        match unsafe { WaitForSingleObject(handle, INFINITE) } {
+            res if res == WAIT_OBJECT_0 || res == WAIT_ABANDONED => Ok(Self {
+                handle,
+                _not_send: PhantomData,
+            }),
+            _ => {
+                // SAFETY: The handle is valid since it was created right above
+                unsafe { CloseHandle(handle)? };
+                Err(get_last_error())
+            }
+        }
+    }
+}
+
+impl Drop for NamedMutex {
+    fn drop(&mut self) {
+        // SAFETY: the handle is guaranteed to be valid
+        // because this type itself created it and it
+        // was never exposed outside. Also the requirement
+        // that the calling thread must own the handle
+        // is upheld because this type is `!Send`
+        let _ = unsafe { ReleaseMutex(self.handle) };
+
+        // SAFETY: the handle is valid as explained above.
+        let _ = unsafe { CloseHandle(self.handle) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        process::{ExitStatus, Output},
+    };
 
     use wdk_build::{CpuArchitecture, KmdfConfig};
 
@@ -533,7 +662,9 @@ mod tests {
             target_arch: &arch,
             driver_model: DriverConfig::Kmdf(KmdfConfig::default()),
             sample_class: false,
-            verify_signature: false,
+            sign_mode: SignMode::Test {
+                verify_signature: false,
+            },
         };
         let dest_root = target_dir.join(format!("{package_name}_package"));
 
@@ -542,7 +673,12 @@ mod tests {
         let fs = Fs::default();
         let task = PackageTask::new(package_task_params, &wdk_build, &command_exec, &fs);
         assert_eq!(task.package_name, package_name.replace('-', "_"));
-        assert!(!task.verify_signature);
+        assert_eq!(
+            task.sign_mode,
+            SignMode::Test {
+                verify_signature: false,
+            }
+        );
         assert!(!task.sample_class);
         assert_eq!(task.src_inx_file_path, working_dir.join("test_package.inx"));
         assert_eq!(
@@ -596,7 +732,9 @@ mod tests {
             target_arch: &arch,
             driver_model: DriverConfig::Kmdf(KmdfConfig::default()),
             sample_class: false,
-            verify_signature: false,
+            sign_mode: SignMode::Test {
+                verify_signature: false,
+            },
         };
 
         let command_exec = CommandExec::default();
@@ -622,7 +760,9 @@ mod tests {
             target_arch: &arch,
             driver_model: DriverConfig::Kmdf(KmdfConfig::default()),
             sample_class: false,
-            verify_signature: false,
+            sign_mode: SignMode::Test {
+                verify_signature: false,
+            },
         };
 
         let command_exec = CommandExec::default();
@@ -630,5 +770,161 @@ mod tests {
         let fs = Fs::default();
 
         PackageTask::new(package_task_params, &wdk_build, &command_exec, &fs);
+    }
+
+    #[test]
+    fn stampinf_version_overrides_with_env_var() {
+        // verify both with and without the env var set scenarios
+        let scenarios = [
+            ("env_set", Some("1.2.3.4"), true),
+            ("env_empty", Some(""), false),
+            ("env_spaces", Some("  "), false),
+            ("env_unset", None, false),
+        ];
+
+        for (name, env_val, expect_skip_v) in scenarios {
+            let result =
+                crate::test_utils::with_env(&[(STAMPINF_VERSION_ENV_VAR, env_val)], || {
+                    let package_name = "driver";
+                    let working_dir = PathBuf::from("C:/abs/driver");
+                    let target_dir = PathBuf::from("C:/abs/driver/target/debug");
+                    let arch = CpuArchitecture::Amd64;
+
+                    let params = PackageTaskParams {
+                        package_name,
+                        working_dir: &working_dir,
+                        target_dir: &target_dir,
+                        target_arch: &arch,
+                        driver_model: DriverConfig::Kmdf(KmdfConfig::default()),
+                        sample_class: false,
+                        sign_mode: SignMode::Test {
+                            verify_signature: false,
+                        },
+                    };
+
+                    let wdk_build = WdkBuild::default();
+                    let fs = Fs::default();
+                    let mut command_exec = CommandExec::default();
+
+                    command_exec
+                        .expect_run()
+                        .withf(move |cmd: &str, args: &[&str], _, _| {
+                            if cmd != "stampinf" {
+                                return false;
+                            }
+                            let has_v = args.contains(&"-v");
+                            if expect_skip_v {
+                                !has_v
+                            } else {
+                                args.windows(2).any(|w| w == ["-v", "*"])
+                            }
+                        })
+                        .once()
+                        .return_once(|_, _, _, _| {
+                            Ok(Output {
+                                status: ExitStatus::default(),
+                                stdout: vec![],
+                                stderr: vec![],
+                            })
+                        });
+
+                    let task = PackageTask::new(params, &wdk_build, &command_exec, &fs);
+                    task.run_stampinf()
+                });
+
+            assert!(
+                result.is_ok(),
+                "scenario {name} failed (env_set={env_val:?})"
+            );
+        }
+    }
+
+    mod named_mutex {
+        use std::{
+            ffi::CString,
+            sync::{
+                Barrier,
+                atomic::{AtomicUsize, Ordering},
+            },
+            thread,
+            time::Duration,
+        };
+
+        use super::super::NamedMutex;
+
+        /// Tests that two threads successfully acquire `NamedMutex`
+        /// and it prevents them from running concurrently.
+        #[test]
+        fn acquire_works_correctly() {
+            // The way this test work is:
+            // 1. We create two threads that start at the same time thanks
+            // to a barrier
+            // 2. Both increment a counter `active` while they run holding
+            // the mutex
+            // 3. Both also increment another counter `completed` when they finish
+            // 4. We verify that `active` never exceeds 1 i.e. there's no concurrent
+            // execution and `completed` is 2 at the end i.e. both threads run to completion
+
+            let barrier = Barrier::new(2);
+            let active = AtomicUsize::new(0);
+            let completed = AtomicUsize::new(0);
+
+            thread::scope(|s| {
+                for _ in 0..2 {
+                    s.spawn(|| {
+                        let name =
+                            CString::new("happy_path_d44f8b8a817").expect("it is a valid C string");
+
+                        barrier.wait();
+                        let guard = NamedMutex::acquire(name.as_c_str())
+                            .expect("thread should acquire mutex");
+
+                        let active_prev = active.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(active_prev, 0, "named mutex allowed concurrent access");
+
+                        thread::sleep(Duration::from_millis(100));
+
+                        let active_prev = active.fetch_sub(1, Ordering::SeqCst);
+                        assert_eq!(active_prev, 1, "active counter should drop back to zero");
+
+                        drop(guard);
+
+                        completed.fetch_add(1, Ordering::SeqCst);
+                    });
+                }
+            });
+
+            assert_eq!(completed.load(Ordering::SeqCst), 2);
+            assert_eq!(active.load(Ordering::SeqCst), 0);
+        }
+
+        /// Tests that `NamedMutex` can be acquired even after the previous
+        /// owner abandoned it (e.g. crashed) without releasing
+        ///
+        /// What we are really testing here is `WaitForSingleObject`
+        /// inside `NamedMutex::acquire` returning `WAIT_ABANDONED`
+        #[test]
+        fn acquire_works_when_abandoned() {
+            fn acquire_mutex() -> NamedMutex {
+                let name =
+                    CString::new("abandoned_owner_d44f8b8a817").expect("it is a valid C string");
+                NamedMutex::acquire(name.as_c_str()).expect("thread should acquire mutex")
+            }
+
+            // Acquire the mutex on a thread and abandon it
+            thread::scope(|s| {
+                s.spawn(|| {
+                    let guard = acquire_mutex();
+                    // Simulate an abnormal exit while still holding the mutex to trigger the
+                    // WAIT_ABANDONED path for the next owner.
+                    std::mem::forget(guard);
+                });
+            });
+
+            // Try to acquire the same mutex from the main thread
+            // which should succeed despite the abandonment above
+            let guard = acquire_mutex();
+            drop(guard);
+        }
     }
 }

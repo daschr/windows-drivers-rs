@@ -31,24 +31,25 @@ pub enum BuildActionError {
     PackageTask(#[from] PackageTaskError),
     #[error("No valid rust projects in the current working directory: {0}")]
     NoValidRustProjectsInTheDirectory(PathBuf),
-    #[error(
-        "One or more rust (possibly driver) projects failed to build in the emulated workspace: \
-         {0}"
-    )]
+    #[error("One or more packages failed to build in the emulated workspace: {0}")]
     OneOrMoreRustProjectsFailedToBuild(PathBuf),
     #[error("One or more workspace members failed to build in the workspace: {0}")]
     OneOrMoreWorkspaceMembersFailedToBuild(PathBuf),
+    #[error("Unsupported target arch: {0}")]
+    UnsupportedArchitecture(String),
+    #[error("Failed to detect target arch")]
+    CannotDetectTargetArch,
+    #[error("Could not determine target directory for packaging. Cause: {0}")]
+    CannotDetermineTargetDir(String),
 }
 
 /// Errors for the low level build task layer
 #[derive(Error, Debug)]
 pub enum BuildTaskError {
-    #[error("Error getting canonicalized path for manifest file")]
-    CanonicalizeManifestPath(#[from] std::io::Error),
     #[error("Empty manifest path found error")]
     EmptyManifestPath,
     #[error("Error running cargo build command")]
-    CargoBuild(#[from] CommandError),
+    CargoBuild(#[source] CommandError),
     #[error(transparent)]
     FileIo(#[from] FileError),
 }
@@ -73,6 +74,8 @@ pub enum PackageTaskError {
     VerifyCertExistsInStoreInvalidCommandOutput(#[source] FromUtf8Error),
     #[error("Error generating certificate to cert store using makecert")]
     CertGenerationInStoreCommand(#[source] CommandError),
+    #[error("Error while acquiring mutex for generating certificate. HRESULT: {0:#x}")]
+    CertMutexError(i32),
     #[error("Error signing driver binary using signtool")]
     DriverBinarySignCommand(#[source] CommandError),
     #[error("Error verifying signed driver binary using signtool")]

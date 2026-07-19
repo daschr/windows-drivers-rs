@@ -53,22 +53,17 @@ jobs:
             arch: amd64
           - name: aarch64-pc-windows-msvc
             arch: arm64
-    
     runs-on: ${{ matrix.runner.name }}
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Winget
-        if: matrix.runner.name == 'windows-11-arm'
         uses: ./.github/actions/install-winget
         with:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install Winget PowerShell Module
-        shell: pwsh
-        run: Install-Module -Name Microsoft.WinGet.Client -Repository PSGallery -Force
+          # windows-11-arm runner image does not include winget-cli (see https://github.com/actions/partner-runner-images/issues/95).
+          force-cli-install: ${{ matrix.runner.name == 'windows-11-arm' && 'true' || 'false' }}
 
       - name: Install LLVM ${{ matrix.llvm }}
         uses: ./.github/actions/install-llvm
@@ -94,7 +89,7 @@ jobs:
         run: cargo +${{ matrix.rust_toolchain }} build --locked --profile ${{ matrix.cargo_profile }} --target ${{ matrix.target_triple.name }} --workspace --all-features
 
       - name: Install Cargo Make
-        uses: taiki-e/install-action@v2
+        uses: ./.github/actions/install-cargo-tool
         with:
           tool: cargo-make
 
@@ -107,14 +102,20 @@ jobs:
       - name: Package Examples (via Cargo Make)
         run: cargo make --cwd ./examples package-driver-flow +${{ matrix.rust_toolchain }} --locked --profile ${{ matrix.cargo_profile }} --target ${{ matrix.target_triple.name }}
 
+      - name: Build Tests (via Cargo Make)
+        run: cargo make --cwd ./tests build +${{ matrix.rust_toolchain }} --locked --profile ${{ matrix.cargo_profile }} --target ${{ matrix.target_triple.name }}
+
+      - name: Package Tests (via Cargo Make)
+        run: cargo make --cwd ./tests package-driver-flow +${{ matrix.rust_toolchain }} --locked --profile ${{ matrix.cargo_profile }} --target ${{ matrix.target_triple.name }}
+
       # Run cargo-wdk on examples and tests
       - name: Install cargo-wdk
         run: cargo +${{ matrix.rust_toolchain }} install --path=crates/cargo-wdk --profile ${{ matrix.cargo_profile }} --locked --force
 
       - name: Build & Package Examples (via cargo-wdk)
-        run: cargo +${{ matrix.rust_toolchain }} wdk build --profile ${{ matrix.cargo_profile }} --target-arch ${{ matrix.target_triple.arch }} --sample
+        run: cargo +${{ matrix.rust_toolchain }} wdk build --locked --profile ${{ matrix.cargo_profile }} --target-arch ${{ matrix.target_triple.arch }} --sample
         working-directory: ./examples
 
       - name: Run build on tests folder (via cargo-wdk)
-        run: cargo +${{ matrix.rust_toolchain }} wdk build --profile ${{ matrix.cargo_profile }} --target-arch ${{ matrix.target_triple.arch }}
+        run: cargo +${{ matrix.rust_toolchain }} wdk build --locked --profile ${{ matrix.cargo_profile }} --target-arch ${{ matrix.target_triple.arch }}
         working-directory: ./tests

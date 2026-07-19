@@ -10,17 +10,17 @@
 //! includes being ables to select different WDF versions and different driver
 //! models (WDM, KMDF, UMDF).
 
-#![cfg_attr(nightly_toolchain, feature(assert_matches))]
 use std::{
     env,
     fmt,
-    path::{absolute, PathBuf},
+    path::{Path, PathBuf, absolute},
     str::FromStr,
     sync::LazyLock,
 };
 
 pub use bindgen::BuilderExt;
 use metadata::TryFromCargoMetadataError;
+use tracing::debug;
 
 pub mod cargo_make;
 pub mod metadata;
@@ -144,12 +144,81 @@ pub struct UmdfConfig {
     pub minimum_umdf_version_minor: Option<u8>,
 }
 
+/// Metadata providing additional context for [`std::io::Error`] failures
+///
+/// This enum provides structured information about the file system paths
+/// or operations that led to an I/O error. It can represent either single
+/// path operations or operations involving both source and destination paths.
+#[non_exhaustive]
+#[derive(Debug, Error)]
+pub enum IoErrorMetadata {
+    /// Path related to [`std::io::Error`] failure
+    #[error(r#"failed to perform an IO operation on "{path}""#)]
+    Path {
+        /// The file system path where the I/O error occurred
+        path: PathBuf,
+    },
+    /// Source and destination paths related to [`std::io::Error`] failure.
+    ///
+    /// This can be provided for APIs like [`std::fs::copy`] which have both a
+    /// `from` and `to` path.
+    #[error(r#"failed to perform an IO operation from "{from_path}" to "{to_path}""#)]
+    SrcDestPaths {
+        /// The source path in a copy or move operation that failed
+        from_path: PathBuf,
+        /// The destination path in a copy or move operation that failed
+        to_path: PathBuf,
+    },
+}
+
+/// Dedicated error type for I/O operations with extra metadata context
+///
+/// This error type wraps [`std::io::Error`] with additional [`IoErrorMetadata`]
+/// to provide better context about which file system paths or operations
+/// failed. It can be used directly by functions that only perform I/O
+/// operations, and automatically converts to [`ConfigError`] when needed.
+#[derive(Debug, Error)]
+#[error("{metadata}")]
+pub struct IoError {
+    /// Extra metadata related to the error
+    metadata: IoErrorMetadata,
+    /// [`std::io::Error`] that caused the operation to fail
+    #[source]
+    source: std::io::Error,
+}
+
+impl IoError {
+    /// Creates a new `IoError` with a single path and source error.
+    pub fn with_path(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
+        Self {
+            metadata: IoErrorMetadata::Path { path: path.into() },
+            source,
+        }
+    }
+
+    /// Creates a new `IoError` for operations involving a source and
+    /// destination path.
+    pub fn with_src_dest_paths(
+        from_path: impl Into<PathBuf>,
+        to_path: impl Into<PathBuf>,
+        source: std::io::Error,
+    ) -> Self {
+        Self {
+            metadata: IoErrorMetadata::SrcDestPaths {
+                from_path: from_path.into(),
+                to_path: to_path.into(),
+            },
+            source,
+        }
+    }
+}
+
 /// Errors that could result from configuring a build via [`wdk_build`][crate]
 #[derive(Debug, Error)]
 pub enum ConfigError {
     /// Error returned when an [`std::io`] operation fails
     #[error(transparent)]
-    IoError(#[from] std::io::Error),
+    IoError(#[from] IoError),
 
     /// Error returned when an expected directory does not exist
     #[error("cannot find directory: {directory}")]
@@ -244,10 +313,6 @@ rustflags = [\"-C\", \"target-feature=+crt-static\"]
     /// [`metadata::Wdk`]
     #[error(transparent)]
     SerdeError(#[from] metadata::Error),
-
-    /// Error returned when the UCX header file is not found
-    #[error("failed to find {0} header file.")]
-    HeaderNotFound(String, #[source] std::io::Error),
 }
 
 /// Subset of APIs in the Windows Driver Kit
@@ -341,6 +406,7 @@ impl Default for Config {
 impl Config {
     /// Create a new [`Config`] with default values
     #[must_use]
+    #[tracing::instrument(level = "debug")]
     pub fn new() -> Self {
         Self::default()
     }
@@ -361,10 +427,25 @@ impl Config {
     /// # Panics
     ///
     /// Panics if the resolved top-level Cargo manifest path is not valid UTF-8
+    #[tracing::instrument(level = "debug")]
     pub fn from_env_auto() -> Result<Self, ConfigError> {
-        let top_level_manifest = find_top_level_cargo_manifest();
+        let top_level_cargo_manifest_path = find_top_level_cargo_manifest();
+        debug!(
+            "Top level Cargo manifest path: {:?}",
+            top_level_cargo_manifest_path
+        );
+
+        let cwd = top_level_cargo_manifest_path
+            .parent()
+            .expect("Cargo manifest should have a valid parent directory");
+
         let cargo_metadata = MetadataCommand::new()
-            .manifest_path(&top_level_manifest)
+            // Run `cargo_metadata` in the same working directory as the top level manifest in order
+            // to respect `config.toml` overrides
+            .current_dir(cwd)
+            // top-level manifest path must be used in order for metadata from the top-level crates
+            // to be discovered
+            .manifest_path(&top_level_cargo_manifest_path)
             .exec()?;
         let wdk_metadata = metadata::Wdk::try_from(&cargo_metadata)?;
 
@@ -373,7 +454,7 @@ impl Config {
         for manifest_path in metadata::iter_manifest_paths(cargo_metadata)
             .into_iter()
             .chain(std::iter::once(
-                top_level_manifest
+                top_level_cargo_manifest_path
                     .try_into()
                     .expect("Path to Cargo manifests should always be valid UTF8"),
             ))
@@ -395,6 +476,7 @@ impl Config {
     /// was already configured via [`configure_wdk_binary_build`],
     /// [`configure_wdk_library_build`], or
     /// [`configure_wdk_library_build_and_then`]
+    #[tracing::instrument(level = "debug")]
     pub fn emit_check_cfg_settings() {
         for (cfg_key, allowed_values) in EXPORTED_CFG_SETTINGS.iter() {
             let allowed_cfg_value_string =
@@ -428,6 +510,7 @@ impl Config {
     /// Expose `cfg` settings based on this [`Config`] to enable conditional
     /// compilation. This emits specially formatted prints to Cargo based on
     /// this [`Config`].
+    #[tracing::instrument(level = "trace")]
     fn emit_cfg_settings(&self) -> Result<(), ConfigError> {
         Self::emit_check_cfg_settings();
 
@@ -462,6 +545,7 @@ impl Config {
     ///
     /// This function will return an error if any of the required paths do not
     /// exist.
+    #[tracing::instrument(level = "debug")]
     pub fn include_paths(&self) -> Result<impl Iterator<Item = PathBuf>, ConfigError> {
         let mut include_paths = vec![];
         let sdk_version = detect_windows_sdk_version(&self.wdk_content_root)?;
@@ -473,31 +557,16 @@ impl Config {
         let windows_sdk_include_path = include_directory.join(sdk_version);
 
         let crt_include_path = windows_sdk_include_path.join("km/crt");
-        if !crt_include_path.is_dir() {
-            return Err(ConfigError::DirectoryNotFound {
-                directory: crt_include_path.to_string_lossy().into(),
-            });
-        }
-        include_paths.push(absolute(&crt_include_path)?);
+        Self::validate_and_add_folder_path(&mut include_paths, &crt_include_path)?;
 
         let km_or_um_include_path = windows_sdk_include_path.join(match self.driver_config {
             DriverConfig::Wdm | DriverConfig::Kmdf(_) => "km",
             DriverConfig::Umdf(_) => "um",
         });
-        if !km_or_um_include_path.is_dir() {
-            return Err(ConfigError::DirectoryNotFound {
-                directory: km_or_um_include_path.to_string_lossy().into(),
-            });
-        }
-        include_paths.push(absolute(&km_or_um_include_path)?);
+        Self::validate_and_add_folder_path(&mut include_paths, &km_or_um_include_path)?;
 
         let kit_shared_include_path = windows_sdk_include_path.join("shared");
-        if !kit_shared_include_path.is_dir() {
-            return Err(ConfigError::DirectoryNotFound {
-                directory: kit_shared_include_path.to_string_lossy().into(),
-            });
-        }
-        include_paths.push(absolute(&kit_shared_include_path)?);
+        Self::validate_and_add_folder_path(&mut include_paths, &kit_shared_include_path)?;
 
         // Add other driver type-specific include paths
         match &self.driver_config {
@@ -507,39 +576,46 @@ impl Config {
                     "wdf/kmdf/{}.{}",
                     kmdf_config.kmdf_version_major, kmdf_config.target_kmdf_version_minor
                 ));
-                if !kmdf_include_path.is_dir() {
-                    return Err(ConfigError::DirectoryNotFound {
-                        directory: kmdf_include_path.to_string_lossy().into(),
-                    });
-                }
-                include_paths.push(absolute(&kmdf_include_path)?);
+                Self::validate_and_add_folder_path(&mut include_paths, &kmdf_include_path)?;
 
                 // `ufxclient.h` relies on `ufxbase.h` being on the headers search path. The WDK
                 // normally does not automatically include this search path, but it is required
                 // here so that the headers can be processed successfully.
                 let ufx_include_path = km_or_um_include_path.join("ufx/1.1");
-                if !ufx_include_path.is_dir() {
-                    return Err(ConfigError::DirectoryNotFound {
-                        directory: ufx_include_path.to_string_lossy().into(),
-                    });
-                }
-                include_paths.push(absolute(&ufx_include_path)?);
+                Self::validate_and_add_folder_path(&mut include_paths, &ufx_include_path)?;
             }
             DriverConfig::Umdf(umdf_config) => {
                 let umdf_include_path = include_directory.join(format!(
                     "wdf/umdf/{}.{}",
                     umdf_config.umdf_version_major, umdf_config.target_umdf_version_minor
                 ));
-                if !umdf_include_path.is_dir() {
-                    return Err(ConfigError::DirectoryNotFound {
-                        directory: umdf_include_path.to_string_lossy().into(),
-                    });
-                }
-                include_paths.push(absolute(&umdf_include_path)?);
+                Self::validate_and_add_folder_path(&mut include_paths, &umdf_include_path)?;
             }
         }
 
         Ok(include_paths.into_iter())
+    }
+
+    /// Validate that a path refers to an existing directory and push its
+    /// canonical absolute form into the provided collection.
+    ///
+    /// This helper is used for both header include directories and library
+    /// directories. It normalizes paths before insertion.
+    fn validate_and_add_folder_path(
+        include_paths: &mut Vec<PathBuf>,
+        path: &Path,
+    ) -> Result<(), ConfigError> {
+        // Include paths should be directories
+        if !path.is_dir() {
+            return Err(ConfigError::DirectoryNotFound {
+                directory: path.to_string_lossy().into(),
+            });
+        }
+
+        let absolute_path = absolute(path).map_err(|source| IoError::with_path(path, source))?;
+
+        include_paths.push(absolute_path);
+        Ok(())
     }
 
     /// Return library include paths required to build and link based off of
@@ -551,6 +627,7 @@ impl Config {
     ///
     /// This function will return an error if any of the required paths do not
     /// exist.
+    #[tracing::instrument(level = "debug")]
     pub fn library_paths(&self) -> Result<impl Iterator<Item = PathBuf>, ConfigError> {
         let mut library_paths = vec![];
         let sdk_version = detect_windows_sdk_version(&self.wdk_content_root)?;
@@ -559,7 +636,7 @@ impl Config {
         // Based off of logic from WindowsDriver.KernelMode.props &
         // WindowsDriver.UserMode.props in NI(22H2) WDK
         let windows_sdk_library_path = self.sdk_library_path(sdk_version)?;
-        library_paths.push(absolute(&windows_sdk_library_path)?);
+        Self::validate_and_add_folder_path(&mut library_paths, &windows_sdk_library_path)?;
 
         // Add other driver type-specific library paths
         let library_directory = self.wdk_content_root.join("Lib");
@@ -572,12 +649,7 @@ impl Config {
                     kmdf_config.kmdf_version_major,
                     kmdf_config.target_kmdf_version_minor
                 ));
-                if !kmdf_library_path.is_dir() {
-                    return Err(ConfigError::DirectoryNotFound {
-                        directory: kmdf_library_path.to_string_lossy().into(),
-                    });
-                }
-                library_paths.push(absolute(&kmdf_library_path)?);
+                Self::validate_and_add_folder_path(&mut library_paths, &kmdf_library_path)?;
             }
             DriverConfig::Umdf(umdf_config) => {
                 let umdf_library_path = library_directory.join(format!(
@@ -586,12 +658,7 @@ impl Config {
                     umdf_config.umdf_version_major,
                     umdf_config.target_umdf_version_minor,
                 ));
-                if !umdf_library_path.is_dir() {
-                    return Err(ConfigError::DirectoryNotFound {
-                        directory: umdf_library_path.to_string_lossy().into(),
-                    });
-                }
-                library_paths.push(absolute(&umdf_library_path)?);
+                Self::validate_and_add_folder_path(&mut library_paths, &umdf_library_path)?;
             }
         }
 
@@ -603,6 +670,7 @@ impl Config {
 
     /// Return an iterator of strings that represent compiler definitions
     /// derived from the `Config`
+    #[tracing::instrument(level = "debug")]
     pub fn preprocessor_definitions(&self) -> impl Iterator<Item = (String, Option<String>)> {
         // _WIN32_WINNT=$(WIN32_WINNT_VERSION);
         // WINVER=$(WINVER_VERSION);
@@ -698,6 +766,7 @@ impl Config {
 
     /// Return an iterator of strings that represent compiler flags (i.e.
     /// warnings, settings, etc.) used by bindgen to parse WDK headers
+    #[tracing::instrument(level = "debug")]
     pub fn wdk_bindgen_compiler_flags() -> impl Iterator<Item = String> {
         vec![
             // Enable Microsoft C/C++ extensions and compatibility options (https://clang.llvm.org/docs/UsersManual.html#microsoft-extensions)
@@ -726,7 +795,7 @@ impl Config {
             "--warn-=no-microsoft",
         ]
         .into_iter()
-        .map(std::string::ToString::to_string)
+        .map(ToString::to_string)
     }
 
     /// Returns a [`String`] iterator over all the headers for a given
@@ -738,6 +807,7 @@ impl Config {
     /// # Errors
     /// [`ConfigError`] - if the headers for the given [`ApiSubset`] could not
     /// be determined
+    #[tracing::instrument(level = "debug")]
     pub fn headers(
         &self,
         api_subset: ApiSubset,
@@ -760,6 +830,7 @@ impl Config {
             .into_iter())
     }
 
+    #[tracing::instrument(level = "trace")]
     fn base_headers(&self) -> Vec<&'static str> {
         match &self.driver_config {
             DriverConfig::Wdm | DriverConfig::Kmdf(_) => {
@@ -771,6 +842,7 @@ impl Config {
         }
     }
 
+    #[tracing::instrument(level = "trace")]
     fn wdf_headers(&self) -> Vec<&'static str> {
         if matches!(
             self.driver_config,
@@ -782,6 +854,7 @@ impl Config {
         }
     }
 
+    #[tracing::instrument(level = "trace")]
     fn gpio_headers(&self) -> Vec<&'static str> {
         let mut headers = vec!["gpio.h"];
         if matches!(self.driver_config, DriverConfig::Kmdf(_)) {
@@ -790,6 +863,7 @@ impl Config {
         headers
     }
 
+    #[tracing::instrument(level = "trace")]
     fn hid_headers(&self) -> Vec<&'static str> {
         let mut headers = vec!["hidclass.h", "hidsdi.h", "hidpi.h", "vhf.h"];
         if matches!(
@@ -805,6 +879,7 @@ impl Config {
         headers
     }
 
+    #[tracing::instrument(level = "trace")]
     fn parallel_ports_headers(&self) -> Vec<&'static str> {
         let mut headers = vec!["ntddpar.h", "ntddser.h"];
         if matches!(
@@ -816,6 +891,7 @@ impl Config {
         headers
     }
 
+    #[tracing::instrument(level = "trace")]
     fn spb_headers(&self) -> Vec<&'static str> {
         let mut headers = vec!["spb.h", "reshub.h"];
         if matches!(
@@ -830,6 +906,7 @@ impl Config {
         headers
     }
 
+    #[tracing::instrument(level = "trace")]
     fn storage_headers(&self) -> Vec<&'static str> {
         let mut headers = vec![
             "ehstorioctl.h",
@@ -862,6 +939,7 @@ impl Config {
         headers
     }
 
+    #[tracing::instrument(level = "trace")]
     fn usb_headers(&self) -> Result<Vec<String>, ConfigError> {
         let mut headers = Vec::new();
         headers.extend(
@@ -873,7 +951,7 @@ impl Config {
                 "Usbpmapi.h",
             ]
             .iter()
-            .map(std::string::ToString::to_string),
+            .map(ToString::to_string),
         );
         if matches!(
             self.driver_config,
@@ -882,7 +960,7 @@ impl Config {
             headers.extend(
                 ["usbbusif.h", "usbdlib.h", "usbfnattach.h", "usbfnioctl.h"]
                     .iter()
-                    .map(std::string::ToString::to_string),
+                    .map(ToString::to_string),
             );
         }
 
@@ -905,7 +983,7 @@ impl Config {
                     "urs/1.0/UrsCx.h",
                 ]
                 .iter()
-                .map(std::string::ToString::to_string),
+                .map(ToString::to_string),
             );
 
             let latest_ucx_header_path = self.ucx_header()?;
@@ -935,6 +1013,7 @@ impl Config {
     /// This function checks if the current Clang version is 20.0 or newer,
     /// where the issue was fixed. See
     /// <https://github.com/llvm/llvm-project/issues/124869> for details.
+    #[tracing::instrument(level = "trace")]
     fn should_include_ufxclient() -> bool {
         const MINIMUM_CLANG_MAJOR_VERSION_WITH_INVALID_INLINE_FIX: u32 = 20;
 
@@ -973,9 +1052,10 @@ impl Config {
     /// # Errors
     /// [`ConfigError`] - if the headers for a [`ApiSubset`] could not be
     /// determined
+    #[tracing::instrument(level = "debug")]
     pub fn bindgen_header_contents(
         &self,
-        api_subsets: impl IntoIterator<Item = ApiSubset>,
+        api_subsets: impl IntoIterator<Item = ApiSubset> + fmt::Debug,
     ) -> Result<String, ConfigError> {
         let mut r = String::new();
 
@@ -1013,6 +1093,7 @@ impl Config {
     ///
     /// This function will return an error if the [`Config`] fails to be
     /// serialized
+    #[tracing::instrument(level = "debug")]
     pub fn configure_library_build(&self) -> Result<(), ConfigError> {
         self.emit_cfg_settings()
     }
@@ -1021,6 +1102,7 @@ impl Config {
     /// dispatching based off of the [`Config`]. Returns `None` if the driver
     /// model is [`DriverConfig::Wdm`]
     #[must_use]
+    #[tracing::instrument(level = "debug")]
     pub fn compute_wdffunctions_symbol_name(&self) -> Option<String> {
         let (wdf_major_version, wdf_minor_version) = match self.driver_config {
             DriverConfig::Kmdf(config) => {
@@ -1053,6 +1135,7 @@ impl Config {
     /// # Panics
     ///
     /// Panics if the invoked from outside a Cargo build environment
+    #[tracing::instrument(level = "debug")]
     pub fn configure_binary_build(&self) -> Result<(), ConfigError> {
         if !Self::is_crt_static_linked() {
             cfg_if::cfg_if! {
@@ -1178,6 +1261,7 @@ impl Config {
         self.emit_cfg_settings()
     }
 
+    #[tracing::instrument(level = "trace")]
     fn is_crt_static_linked() -> bool {
         const STATICALLY_LINKED_C_RUNTIME_FEATURE_NAME: &str = "crt-static";
 
@@ -1206,6 +1290,7 @@ impl Config {
     ///
     /// KMDF/AMD64: `C:\...\Lib\10.0.22621.0\km\x64`
     /// UMDF/ARM64: `C:\...\Lib\10.0.22621.0\um\arm64`
+    #[tracing::instrument(level = "trace")]
     fn sdk_library_path(&self, sdk_version: String) -> Result<PathBuf, ConfigError> {
         let windows_sdk_library_path =
             self.wdk_content_root
@@ -1213,10 +1298,10 @@ impl Config {
                 .join(sdk_version)
                 .join(match self.driver_config {
                     DriverConfig::Wdm | DriverConfig::Kmdf(_) => {
-                        format!("km/{}", self.cpu_architecture.as_windows_str(),)
+                        format!("km/{}", self.cpu_architecture.as_windows_str())
                     }
                     DriverConfig::Umdf(_) => {
-                        format!("um/{}", self.cpu_architecture.as_windows_str(),)
+                        format!("um/{}", self.cpu_architecture.as_windows_str())
                     }
                 });
         if !windows_sdk_library_path.is_dir() {
@@ -1229,11 +1314,11 @@ impl Config {
 
     /// Returns the path to the latest available UCX header file present in the
     /// Lib folder of the WDK content root
+    #[tracing::instrument(level = "trace")]
     fn ucx_header(&self) -> Result<String, ConfigError> {
         let sdk_version = utils::detect_windows_sdk_version(&self.wdk_content_root)?;
         let ucx_header_root_dir = self.sdk_library_path(sdk_version)?.join("ucx");
-        let max_version = utils::find_max_version_in_directory(&ucx_header_root_dir)
-            .map_err(|e| ConfigError::HeaderNotFound("ucxclass.h".into(), e))?;
+        let max_version = utils::find_max_version_in_directory(&ucx_header_root_dir)?;
         let path = format!("ucx/{}.{}/ucxclass.h", max_version.0, max_version.1);
         Ok(path)
     }
@@ -1330,9 +1415,10 @@ impl CpuArchitecture {
 /// Panics if a `Cargo.lock` file cannot be found in any of the ancestors of
 /// `OUT_DIR` or if this function was called outside of a `build.rs` file
 #[must_use]
+#[tracing::instrument(level = "debug")]
 pub fn find_top_level_cargo_manifest() -> PathBuf {
     let out_dir =
-        PathBuf::from(std::env::var("OUT_DIR").expect(
+        PathBuf::from(env::var("OUT_DIR").expect(
             "Cargo should have set the OUT_DIR environment variable when executing build.rs",
         ));
 
@@ -1357,6 +1443,7 @@ pub fn find_top_level_cargo_manifest() -> PathBuf {
 ///
 /// This function will return an error if the [`Config`] fails to be
 /// serialized
+#[tracing::instrument(level = "debug")]
 pub fn configure_wdk_library_build() -> Result<(), ConfigError> {
     match Config::from_env_auto() {
         Ok(config) => {
@@ -1396,6 +1483,7 @@ pub fn configure_wdk_library_build() -> Result<(), ConfigError> {
 ///
 /// This function will return an error if the [`Config`] fails to be
 /// serialized
+#[tracing::instrument(level = "debug", skip(f))]
 pub fn configure_wdk_library_build_and_then<F, E>(mut f: F) -> Result<(), E>
 where
     F: FnMut(Config) -> Result<(), E>,
@@ -1404,6 +1492,7 @@ where
     match Config::from_env_auto() {
         Ok(config) => {
             config.configure_library_build()?;
+            debug!("Calling closure with {config:#?}");
             Ok(f(config)?)
         }
         Err(ConfigError::TryFromCargoMetadataError(
@@ -1435,6 +1524,7 @@ where
 /// # Panics
 ///
 /// Panics if the invoked from outside a Cargo build environment
+#[tracing::instrument(level = "debug")]
 pub fn configure_wdk_binary_build() -> Result<(), ConfigError> {
     Config::from_env_auto()?.configure_binary_build()
 }
@@ -1468,6 +1558,7 @@ static EXPORTED_CFG_SETTINGS: LazyLock<Vec<(&'static str, Vec<&'static str>)>> =
 ///
 /// Panics if the WDK version number cannot be extracted from
 /// the version string.
+#[tracing::instrument(level = "debug")]
 pub fn detect_wdk_build_number() -> Result<u32, ConfigError> {
     let wdk_content_root =
         utils::detect_wdk_content_root().ok_or(ConfigError::WdkContentRootDetectionError)?;
@@ -1489,11 +1580,12 @@ pub fn detect_wdk_build_number() -> Result<u32, ConfigError> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(nightly_toolchain)]
-    use std::assert_matches::assert_matches;
+    #[cfg(assert_matches_stabilized)]
+    use std::assert_matches;
     use std::{collections::HashMap, ffi::OsStr, sync::Mutex};
 
     use super::*;
+    use crate::utils::{remove_var, set_var};
 
     mod two_part_version {
         use super::*;
@@ -1714,7 +1806,7 @@ mod tests {
     /// # Panics
     ///
     /// Panics if called with duplicate environment variable keys.
-    pub fn with_env<K, V, F, R>(env_vars_key_value_pairs: &[(K, V)], f: F) -> R
+    pub fn with_env<K, V, F, R>(env_vars_key_value_pairs: &[(K, Option<V>)], f: F) -> R
     where
         K: AsRef<OsStr> + std::cmp::Eq + std::hash::Hash,
         V: AsRef<OsStr>,
@@ -1729,14 +1821,19 @@ mod tests {
 
         // set requested environment variables
         for (key, value) in env_vars_key_value_pairs {
-            if let Ok(original_value) = std::env::var(key) {
+            if let Ok(original_value) = env::var(key) {
                 let insert_result = original_env_vars.insert(key, original_value);
                 assert!(
                     insert_result.is_none(),
                     "Duplicate environment variable keys were provided"
                 );
             }
-            std::env::set_var(key, value);
+
+            if let Some(value) = value {
+                set_var(key, value);
+            } else {
+                remove_var(key);
+            }
         }
 
         let f_return_value = f();
@@ -1745,10 +1842,10 @@ mod tests {
         for (key, _) in env_vars_key_value_pairs {
             original_env_vars.get(key).map_or_else(
                 || {
-                    std::env::remove_var(key);
+                    remove_var(key);
                 },
                 |value| {
-                    std::env::set_var(key, value);
+                    set_var(key, value);
                 },
             );
         }
@@ -1758,33 +1855,33 @@ mod tests {
 
     #[test]
     fn default_config() {
-        let config = with_env(&[("CARGO_CFG_TARGET_ARCH", "x86_64")], Config::new);
+        let config = with_env(&[("CARGO_CFG_TARGET_ARCH", Some("x86_64"))], Config::new);
 
-        #[cfg(nightly_toolchain)]
+        #[cfg(assert_matches_stabilized)]
         assert_matches!(config.driver_config, DriverConfig::Wdm);
         assert_eq!(config.cpu_architecture, CpuArchitecture::Amd64);
     }
 
     #[test]
     fn wdm_config() {
-        let config = with_env(&[("CARGO_CFG_TARGET_ARCH", "x86_64")], || Config {
+        let config = with_env(&[("CARGO_CFG_TARGET_ARCH", Some("x86_64"))], || Config {
             driver_config: DriverConfig::Wdm,
             ..Config::default()
         });
 
-        #[cfg(nightly_toolchain)]
+        #[cfg(assert_matches_stabilized)]
         assert_matches!(config.driver_config, DriverConfig::Wdm);
         assert_eq!(config.cpu_architecture, CpuArchitecture::Amd64);
     }
 
     #[test]
     fn default_kmdf_config() {
-        let config = with_env(&[("CARGO_CFG_TARGET_ARCH", "x86_64")], || Config {
+        let config = with_env(&[("CARGO_CFG_TARGET_ARCH", Some("x86_64"))], || Config {
             driver_config: DriverConfig::Kmdf(KmdfConfig::new()),
             ..Config::default()
         });
 
-        #[cfg(nightly_toolchain)]
+        #[cfg(assert_matches_stabilized)]
         assert_matches!(
             config.driver_config,
             DriverConfig::Kmdf(KmdfConfig {
@@ -1798,7 +1895,7 @@ mod tests {
 
     #[test]
     fn kmdf_config() {
-        let config = with_env(&[("CARGO_CFG_TARGET_ARCH", "x86_64")], || Config {
+        let config = with_env(&[("CARGO_CFG_TARGET_ARCH", Some("x86_64"))], || Config {
             driver_config: DriverConfig::Kmdf(KmdfConfig {
                 kmdf_version_major: 1,
                 target_kmdf_version_minor: 15,
@@ -1807,7 +1904,7 @@ mod tests {
             ..Config::default()
         });
 
-        #[cfg(nightly_toolchain)]
+        #[cfg(assert_matches_stabilized)]
         assert_matches!(
             config.driver_config,
             DriverConfig::Kmdf(KmdfConfig {
@@ -1821,12 +1918,12 @@ mod tests {
 
     #[test]
     fn default_umdf_config() {
-        let config = with_env(&[("CARGO_CFG_TARGET_ARCH", "x86_64")], || Config {
+        let config = with_env(&[("CARGO_CFG_TARGET_ARCH", Some("x86_64"))], || Config {
             driver_config: DriverConfig::Umdf(UmdfConfig::new()),
             ..Config::default()
         });
 
-        #[cfg(nightly_toolchain)]
+        #[cfg(assert_matches_stabilized)]
         assert_matches!(
             config.driver_config,
             DriverConfig::Umdf(UmdfConfig {
@@ -1840,7 +1937,7 @@ mod tests {
 
     #[test]
     fn umdf_config() {
-        let config = with_env(&[("CARGO_CFG_TARGET_ARCH", "aarch64")], || Config {
+        let config = with_env(&[("CARGO_CFG_TARGET_ARCH", Some("aarch64"))], || Config {
             driver_config: DriverConfig::Umdf(UmdfConfig {
                 umdf_version_major: 2,
                 target_umdf_version_minor: 15,
@@ -1849,7 +1946,7 @@ mod tests {
             ..Config::default()
         });
 
-        #[cfg(nightly_toolchain)]
+        #[cfg(assert_matches_stabilized)]
         assert_matches!(
             config.driver_config,
             DriverConfig::Umdf(UmdfConfig {
@@ -1880,7 +1977,7 @@ mod tests {
 
         #[test]
         fn wdm() {
-            let config = with_env(&[("CARGO_CFG_TARGET_ARCH", "x86_64")], || Config {
+            let config = with_env(&[("CARGO_CFG_TARGET_ARCH", Some("x86_64"))], || Config {
                 driver_config: DriverConfig::Wdm,
                 ..Default::default()
             });
@@ -1896,7 +1993,7 @@ mod tests {
 
         #[test]
         fn kmdf() {
-            let config = with_env(&[("CARGO_CFG_TARGET_ARCH", "x86_64")], || Config {
+            let config = with_env(&[("CARGO_CFG_TARGET_ARCH", Some("x86_64"))], || Config {
                 driver_config: DriverConfig::Kmdf(KmdfConfig {
                     kmdf_version_major: 1,
                     target_kmdf_version_minor: 33,
@@ -1919,7 +2016,7 @@ mod tests {
 
         #[test]
         fn umdf() {
-            let config = with_env(&[("CARGO_CFG_TARGET_ARCH", "aarch64")], || Config {
+            let config = with_env(&[("CARGO_CFG_TARGET_ARCH", Some("aarch64"))], || Config {
                 driver_config: DriverConfig::Umdf(UmdfConfig {
                     umdf_version_major: 2,
                     target_umdf_version_minor: 15,
@@ -1964,7 +2061,7 @@ mod tests {
 
         #[test]
         fn kmdf() {
-            let config = with_env(&[("CARGO_CFG_TARGET_ARCH", "x86_64")], || Config {
+            let config = with_env(&[("CARGO_CFG_TARGET_ARCH", Some("x86_64"))], || Config {
                 driver_config: DriverConfig::Kmdf(KmdfConfig {
                     kmdf_version_major: 1,
                     target_kmdf_version_minor: 15,
@@ -1980,7 +2077,7 @@ mod tests {
 
         #[test]
         fn umdf() {
-            let config = with_env(&[("CARGO_CFG_TARGET_ARCH", "aarch64")], || Config {
+            let config = with_env(&[("CARGO_CFG_TARGET_ARCH", Some("aarch64"))], || Config {
                 driver_config: DriverConfig::Umdf(UmdfConfig {
                     umdf_version_major: 2,
                     target_umdf_version_minor: 33,
@@ -1996,7 +2093,7 @@ mod tests {
 
         #[test]
         fn wdm() {
-            let config = with_env(&[("CARGO_CFG_TARGET_ARCH", "x86_64")], || Config {
+            let config = with_env(&[("CARGO_CFG_TARGET_ARCH", Some("x86_64"))], || Config {
                 driver_config: DriverConfig::Wdm,
                 ..Default::default()
             });
@@ -2004,6 +2101,177 @@ mod tests {
             let result = config.compute_wdffunctions_symbol_name();
 
             assert_eq!(result, None);
+        }
+    }
+
+    mod validate_and_add_folder_path {
+        use assert_fs::prelude::*;
+
+        use super::*;
+
+        #[test]
+        fn valid_directory_is_added_successfully() {
+            let temp_dir = assert_fs::TempDir::new().unwrap();
+            let mut include_paths = Vec::new();
+
+            let result = Config::validate_and_add_folder_path(&mut include_paths, temp_dir.path());
+
+            assert!(result.is_ok());
+            assert_eq!(include_paths.len(), 1);
+            assert!(include_paths[0].exists());
+            assert!(include_paths[0].is_dir());
+
+            // Verify the exact canonicalized path was added
+            let expected_path = absolute(temp_dir.path()).unwrap();
+            assert_eq!(include_paths[0], expected_path);
+        }
+
+        #[test]
+        fn non_existent_path_returns_directory_not_found_error() {
+            let non_existent_path = std::path::Path::new("/this/path/does/not/exist");
+            let mut include_paths = Vec::new();
+
+            let result =
+                Config::validate_and_add_folder_path(&mut include_paths, non_existent_path);
+
+            assert!(result.is_err());
+            #[cfg(assert_matches_stabilized)]
+            assert_matches!(
+                result.unwrap_err(),
+                ConfigError::DirectoryNotFound { directory } if directory == non_existent_path.to_string_lossy()
+            );
+            assert_eq!(include_paths.len(), 0);
+        }
+
+        #[test]
+        fn file_path_returns_directory_not_found_error() {
+            let temp_dir = assert_fs::TempDir::new().unwrap();
+            let file = temp_dir.child("test_file.txt");
+            file.write_str("test content").unwrap();
+            let mut include_paths = Vec::new();
+
+            let result = Config::validate_and_add_folder_path(&mut include_paths, file.path());
+
+            assert!(result.is_err());
+            #[cfg(assert_matches_stabilized)]
+            assert_matches!(
+                result.unwrap_err(),
+                ConfigError::DirectoryNotFound { directory } if directory == file.path().to_string_lossy()
+            );
+            assert_eq!(include_paths.len(), 0);
+        }
+
+        #[test]
+        fn path_is_canonicalized_before_adding() {
+            let temp_dir = assert_fs::TempDir::new().unwrap();
+            let sub_dir = temp_dir.child("subdir");
+            sub_dir.create_dir_all().unwrap();
+
+            // Create a path with ".." to test canonicalization
+            let complex_path = sub_dir.path().join("..").join("subdir");
+            let mut include_paths = Vec::new();
+
+            let result = Config::validate_and_add_folder_path(&mut include_paths, &complex_path);
+
+            assert!(result.is_ok());
+            assert_eq!(include_paths.len(), 1);
+
+            // The canonicalized path should not contain ".."
+            assert!(!include_paths[0].to_string_lossy().contains(".."));
+            assert!(include_paths[0].is_absolute());
+
+            // Verify the path resolves to the actual subdir path
+            let expected_path = absolute(sub_dir.path()).unwrap();
+            assert_eq!(include_paths[0], expected_path);
+        }
+
+        #[test]
+        fn multiple_paths_are_added_correctly() {
+            let temp_dir = assert_fs::TempDir::new().unwrap();
+            let dir1 = temp_dir.child("dir1");
+            let dir2 = temp_dir.child("dir2");
+            dir1.create_dir_all().unwrap();
+            dir2.create_dir_all().unwrap();
+
+            let mut include_paths = Vec::new();
+
+            let result1 = Config::validate_and_add_folder_path(&mut include_paths, dir1.path());
+            let result2 = Config::validate_and_add_folder_path(&mut include_paths, dir2.path());
+
+            assert!(result1.is_ok());
+            assert!(result2.is_ok());
+            assert_eq!(include_paths.len(), 2);
+
+            // Both paths should be present and different
+            assert_ne!(include_paths[0], include_paths[1]);
+            assert!(include_paths[0].exists());
+            assert!(include_paths[1].exists());
+
+            // Verify both paths match their expected canonicalized values
+            let expected_path1 = absolute(dir1.path()).unwrap();
+            let expected_path2 = absolute(dir2.path()).unwrap();
+            assert_eq!(include_paths[0], expected_path1);
+            assert_eq!(include_paths[1], expected_path2);
+        }
+
+        #[test]
+        fn nested_directory_is_handled_correctly() {
+            let temp_dir = assert_fs::TempDir::new().unwrap();
+            let nested_dir = temp_dir.child("level1").child("level2").child("level3");
+            nested_dir.create_dir_all().unwrap();
+            let mut include_paths = Vec::new();
+
+            let result =
+                Config::validate_and_add_folder_path(&mut include_paths, nested_dir.path());
+
+            assert!(result.is_ok());
+            assert_eq!(include_paths.len(), 1);
+            assert!(include_paths[0].exists());
+            assert!(include_paths[0].is_dir());
+
+            // Verify the nested path matches the expected canonicalized value
+            let expected_path = absolute(nested_dir.path()).unwrap();
+            assert_eq!(include_paths[0], expected_path);
+        }
+
+        #[test]
+        fn same_directory_can_be_added_multiple_times() {
+            let temp_dir = assert_fs::TempDir::new().unwrap();
+            let mut include_paths = Vec::new();
+
+            let result1 = Config::validate_and_add_folder_path(&mut include_paths, temp_dir.path());
+            let result2 = Config::validate_and_add_folder_path(&mut include_paths, temp_dir.path());
+
+            assert!(result1.is_ok());
+            assert!(result2.is_ok());
+            assert_eq!(include_paths.len(), 2);
+            assert_eq!(include_paths[0], include_paths[1]);
+
+            // Verify both entries match the expected canonicalized path
+            let expected_path = absolute(temp_dir.path()).unwrap();
+            assert_eq!(include_paths[0], expected_path);
+            assert_eq!(include_paths[1], expected_path);
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn windows_extended_length_paths_are_stripped() {
+            let temp_dir = assert_fs::TempDir::new().unwrap();
+            let mut include_paths = Vec::new();
+
+            let result = Config::validate_and_add_folder_path(&mut include_paths, temp_dir.path());
+
+            assert!(result.is_ok());
+            assert_eq!(include_paths.len(), 1);
+
+            // `validate_and_add_folder_path` should always ensure that the path should not
+            // start with \\?\ on Windows
+            let path_str = include_paths[0].to_string_lossy();
+            assert!(!path_str.starts_with(r"\\?\"));
+
+            // Verify the path matches expected value
+            let expected_path = absolute(temp_dir.path()).unwrap();
+            assert_eq!(include_paths[0], expected_path);
         }
     }
 }
