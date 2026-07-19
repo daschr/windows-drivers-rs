@@ -576,10 +576,12 @@ fn generate_filesystem(out_path: &Path, config: &Config) -> Result<(), ConfigErr
             };
             trace!(bindgen_builder = ?bindgen_builder);
 
+            let op = out_path.join("filesystem.rs");
+
             Ok(bindgen_builder
                 .generate()
                 .expect("Bindings should succeed to generate")
-                .write_to_file(out_path.join("filesystem.rs"))?)
+                .write_to_file(&op).map_err(|e| IoError::with_path(op, e))?)
         } else {
             let _ = (out_path, config); // Silence unused variable warnings when usb feature is not enabled
 
